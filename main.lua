@@ -1,7 +1,7 @@
 --- @since 26.9.1
 
--- stowr: move the hovered (or marked) file(s) into a GNU Stow package inside
--- your dotfiles repo, then run `stow` so the symlink is created back in place.
+-- stowr: move the hovered (or marked) files/directories into a GNU Stow package
+-- inside your dotfiles repo, then run `stow` so the symlink is created back in place.
 
 local HOME = os.getenv("HOME")
 
@@ -61,13 +61,27 @@ local get_last_pkg = ya.sync(function(state)
 	return state.last_pkg or ""
 end)
 
--- Rename, falling back to copy+remove across file systems.
-local function move(src, dest)
+-- Remove a file, symlink or directory, whichever the path is.
+local function remove_path(url)
+	local cha = fs.cha(Url(url))
+	if not cha then
+		return true
+	end
+	return fs.remove(cha.is_dir and "dir_all" or "file", Url(url))
+end
+
+-- Rename, falling back to copy+remove across file systems. `fs.copy` only
+-- handles single files, so directories go through `cp -a`.
+local function move(src, dest, is_dir)
 	local ok, err = fs.rename(Url(src), Url(dest))
 	if ok then
 		return true
 	end
-	if err and err.kind == "CrossesDevices" then
+	if not (err and err.kind == "CrossesDevices") then
+		return false, err
+	end
+
+	if not is_dir then
 		local _, cerr = fs.copy(Url(src), Url(dest))
 		if cerr then
 			return false, cerr
@@ -78,34 +92,80 @@ local function move(src, dest)
 		end
 		return true
 	end
-	return false, err
+
+	local output, cerr = Command("cp"):arg { "-a", "--", src, dest }:output()
+	if not output or cerr or not output.status.success then
+		return false, cerr or output.stderr or ("cp exited with code " .. tostring(output.status.code))
+	end
+	local rm, rerr = Command("rm"):arg { "-rf", "--", src }:output()
+	if not rm or rerr or not rm.status.success then
+		return false, rerr or rm.stderr or ("rm exited with code " .. tostring(rm.status.code))
+	end
+	return true
 end
 
--- Restore the moved files, then drop the package tree if we created it.
-local function rollback(moved, dotfiles, pkg, pkg_existed)
+-- Put `p.src` at `p.dest`. When the destination already exists, the old content
+-- is swapped out through a temp name in the same directory, so `stow` never sees
+-- anything but the final tree and at every instant either the old or the new
+-- content is in place. Returns (ok, err, partial): `partial` is the path that may
+-- hold a half-written copy, if any.
+local function place(p)
+	if not p.conflict then
+		local ok, err = move(p.src, p.dest, p.is_dir)
+		return ok, err, p.dest
+	end
+
+	local tmp = p.dest .. ".stowr-new"
+	remove_path(tmp)
+
+	local ok, err = move(p.src, tmp, p.is_dir)
+	if not ok then
+		return false, err, tmp
+	end
+
+	local removed, rerr = remove_path(p.dest)
+	if not removed then
+		move(tmp, p.src, p.is_dir)
+		return false, rerr
+	end
+
+	local ok2, err2 = fs.rename(Url(tmp), Url(p.dest))
+	if not ok2 then
+		return false, err2, tmp
+	end
+	return true
+end
+
+-- Undo: move items back, drop a half-written copy, then drop a package tree we created.
+local function undo(moved, partial, dotfiles, pkg, pkg_existed)
 	for i = #moved, 1, -1 do
-		local ok, err = move(moved[i].dest, moved[i].src)
+		local m = moved[i]
+		local ok, err = move(m.dest, m.src, m.is_dir)
 		if not ok then
-			ya.err("stowr: rollback failed for " .. moved[i].dest .. ": " .. tostring(err))
+			ya.err("stowr: rollback failed for " .. m.dest .. ": " .. tostring(err))
 		end
+	end
+	if partial then
+		remove_path(partial)
 	end
 	if not pkg_existed then
 		fs.remove("dir_clean", Url(dotfiles .. "/" .. pkg))
 	end
 end
 
+-- Best-effort package name: the first path segment under $HOME (skipping a
+-- leading `.config`), minus a leading dot and a trailing extension.
 local function guess_pkg(last_pkg, first)
-	if HOME then
-		local seg = first:match("^" .. HOME:gsub("%W", "%%%0") .. "/%.config/([^/]+)/")
-		if seg then
-			return seg
-		end
+	if not HOME or not is_under_home(first) then
+		return last_pkg
 	end
-	local parent = first:match("^(.*)/[^/]+$")
-	if parent then
-		return parent:match("([^/]+)$") or last_pkg
+	local rel = first:sub(#HOME + 2)
+	local seg = rel:match("^([^/]+)")
+	if seg == ".config" then
+		seg = rel:match("^%.config/([^/]+)") or seg
 	end
-	return last_pkg
+	local name = seg:gsub("^%.", ""):gsub("%.[^.]*$", "")
+	return name ~= "" and name or last_pkg
 end
 
 return {
@@ -127,8 +187,6 @@ return {
 			local why
 			if t.link then
 				why = t.name .. " is already a symlink (already stowed?)"
-			elseif t.dir then
-				why = t.name .. " is a directory"
 			elseif not is_under_home(t.url) then
 				why = t.name .. " is outside $HOME"
 			end
@@ -139,9 +197,9 @@ return {
 
 		local body
 		if #targets == 1 then
-			body = "Do you want to stow this file: " .. targets[1].name .. "?"
+			body = "Do you want to stow this " .. (targets[1].dir and "folder" or "file") .. ": " .. targets[1].name .. "?"
 		else
-			body = "Do you want to stow these " .. #targets .. " files?"
+			body = "Do you want to stow these " .. #targets .. " items?"
 			for i, t in ipairs(targets) do
 				if i > 10 then
 					body = body .. "\n…"
@@ -174,22 +232,25 @@ return {
 			plan[#plan + 1] = {
 				src = t.url,
 				name = t.name,
+				is_dir = t.dir,
 				dest = dotfiles .. "/" .. pkg .. "/" .. t.url:sub(#HOME + 2),
 			}
 		end
 
-		local conflicts = {}
+		local conflicts, first_conflict = 0, nil
 		for _, p in ipairs(plan) do
 			if fs.cha(Url(p.dest)) then
-				conflicts[#conflicts + 1] = p
+				p.conflict = true
+				conflicts = conflicts + 1
+				first_conflict = first_conflict or p.dest
 			end
 		end
-		if #conflicts > 0 then
+		if conflicts > 0 then
 			local cbody
-			if #conflicts == 1 then
-				cbody = "This file already exists in the dotfiles package:\n\n" .. conflicts[1].dest .. "\n\nOverwrite it?"
+			if conflicts == 1 then
+				cbody = "This path already exists in the dotfiles package:\n\n" .. first_conflict .. "\n\nOverwrite it?"
 			else
-				cbody = #conflicts .. " files already exist in the dotfiles package. Overwrite them?"
+				cbody = conflicts .. " paths already exist in the dotfiles package. Overwrite them?"
 			end
 			if not ya.confirm { pos = { "center", w = 70, h = 12 }, title = "Stow — overwrite", body = cbody } then
 				return
@@ -202,16 +263,16 @@ return {
 		for _, p in ipairs(plan) do
 			local created, cerr = fs.create("dir_all", Url(dirname(p.dest)))
 			if not created then
-				rollback({}, dotfiles, pkg, pkg_existed)
+				undo({}, {}, nil, dotfiles, pkg, pkg_existed)
 				return ya.notify { title = "Stow", content = "Failed to create " .. dirname(p.dest) .. ": " .. tostring(cerr), level = "error", timeout = 8 }
 			end
 		end
 
 		local moved = {}
 		for _, p in ipairs(plan) do
-			local ok2, merr = move(p.src, p.dest)
+			local ok2, merr, partial = place(p)
 			if not ok2 then
-				rollback(moved, dotfiles, pkg, pkg_existed)
+				undo(moved, partial, dotfiles, pkg, pkg_existed)
 				return ya.notify { title = "Stow", content = "Failed to move " .. p.name .. ": " .. tostring(merr), level = "error", timeout = 8 }
 			end
 			moved[#moved + 1] = p
@@ -224,12 +285,12 @@ return {
 
 		local output, err = Command("stow"):cwd(dotfiles):arg(args):output()
 		if not output or err or not output.status.success then
-			rollback(moved, dotfiles, pkg, pkg_existed)
+			undo(moved, nil, dotfiles, pkg, pkg_existed)
 			local detail = err and tostring(err)
 				or (output.stderr ~= "" and output.stderr or ("stow exited with code " .. tostring(output.status.code)))
 			return ya.notify {
 				title = "Stow failed — rolled back",
-				content = detail .. "\nRestored " .. #moved .. " file(s).",
+				content = detail .. "\nRestored " .. #moved .. " item(s).",
 				level = "error",
 				timeout = 10,
 			}
